@@ -8,14 +8,8 @@ import yfinance as yf
 
 st.set_page_config(page_title="Market Overview Dashboard", layout="wide")
 
-# =========================
-# OPTIONS
-# =========================
 BENCHMARK = "SPY"
 PRICE_HISTORY_PERIOD = "2y"
-
-# If you truly want to HIDE the sparkline column entirely, set this to False
-SHOW_SPARKLINE = True
 
 def _asof_ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -36,13 +30,40 @@ CSS = """
   padding: 10px 12px;
   margin-bottom: 10px;
 }
-[data-testid="stDataFrame"] {border-radius: 10px; overflow: hidden;}
 
-/* Try to allow wrapping so long group names are readable */
-[data-testid="stDataFrame"] div[role="gridcell"] > div {
-  white-space: normal !important;
-  line-height: 1.15 !important;
+/* HTML table styling */
+.pl-table-wrap {border-radius: 10px; overflow: hidden; border: 1px solid rgba(255,255,255,0.10);}
+table.pl-table {border-collapse: collapse; width: 100%; font-size: 13px;}
+table.pl-table thead th {
+  position: sticky; top: 0;
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.92);
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.12);
+  font-weight: 900;
 }
+table.pl-table tbody td{
+  padding: 7px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  vertical-align: middle;
+}
+td.mono {font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}
+td.ticker {font-weight: 900;}
+td.name {white-space: normal; line-height: 1.15;}
+tr.group-row td{
+  background: rgba(0,0,0,0.70) !important;
+  border-bottom: 1px solid rgba(255,255,255,0.10);
+}
+tr.group-row td:not(.name){
+  color: rgba(0,0,0,0) !important; /* truly invisible */
+}
+tr.group-row td.name{
+  color: #FFFFFF !important;
+  font-weight: 950 !important;
+  letter-spacing: 0.2px;
+}
+
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -219,6 +240,7 @@ def parse_ticker_list(raw: str) -> list[str]:
         t = ln.strip().upper()
         if t:
             out.append(t)
+    # keep order, remove duplicates
     seen = set()
     uniq = []
     for t in out:
@@ -327,38 +349,34 @@ def fetch_names(tickers: list[str]) -> dict[str, str]:
     return names
 
 # -----------------------------
-# Sparkline
+# Sparkline (Excel-style gradient: low=red, high=green)
 # -----------------------------
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 SPARK_MAP = {c: i for i, c in enumerate(SPARK_CHARS)}
 
-def sparkline_from_series(s: pd.Series, n=26) -> str:
+def sparkline_from_series(s: pd.Series, n=26):
+    """
+    Returns:
+      spark_string, spark_levels(list[int] 0..7 aligned to characters)
+    """
     s = s.dropna().tail(n)
     if s.empty:
-        return ""
+        return "", []
+
     if s.nunique() == 1:
-        return SPARK_CHARS[len(SPARK_CHARS)//2] * len(s)
+        mid = len(SPARK_CHARS)//2
+        return (SPARK_CHARS[mid] * len(s)), ([mid] * len(s))
 
     lo, hi = float(s.min()), float(s.max())
     if hi - lo <= 1e-12:
-        return ""
+        return "", []
+
     scaled = (s - lo) / (hi - lo)
     idx = (scaled * (len(SPARK_CHARS)-1)).round().astype(int).clip(0, len(SPARK_CHARS)-1)
-    return "".join(SPARK_CHARS[i] for i in idx)
+    levels = idx.tolist()
+    spark = "".join(SPARK_CHARS[i] for i in levels)
+    return spark, levels
 
-def spark_strength(s: str) -> float:
-    s = (s or "").strip()
-    if not s:
-        return np.nan
-    vals = [SPARK_MAP.get(ch, np.nan) for ch in s]
-    vals = [v for v in vals if not np.isnan(v)]
-    if not vals:
-        return np.nan
-    return float(np.mean(vals) / (len(SPARK_CHARS) - 1))
-
-# -----------------------------
-# Metrics / Table
-# -----------------------------
 def _ret(close: pd.Series, periods: int):
     return close.pct_change(periods=periods)
 
@@ -372,8 +390,8 @@ def build_table(p: pd.DataFrame, tickers: list[str], name_map: dict[str, str]) -
     horizons_rs  = {"RS 1W": 5, "RS 1M": 21, "RS 3M": 63, "RS 6M": 126, "RS 1Y": 252}
 
     b = p[BENCHMARK]
-
     rows = []
+
     for t in tickers:
         if t not in p.columns:
             continue
@@ -382,13 +400,15 @@ def build_table(p: pd.DataFrame, tickers: list[str], name_map: dict[str, str]) -
         last_price = float(close.dropna().iloc[-1]) if close.dropna().shape[0] else np.nan
 
         rs_ratio_series = (close / close.shift(21)) / (b / b.shift(21))
-        spark = sparkline_from_series(rs_ratio_series, n=26)
+        spark, levels = sparkline_from_series(rs_ratio_series, n=26)
 
         rec = {
             "Ticker": t,
             "Name": name_map.get(t, t),
             "Price": last_price,
             "Relative Strength 1M": spark,
+            "__spark_levels": levels,   # helper for HTML rendering
+            "__is_header": False
         }
 
         for col, n in horizons_rs.items():
@@ -411,89 +431,7 @@ def build_table(p: pd.DataFrame, tickers: list[str], name_map: dict[str, str]) -
     return df
 
 # -----------------------------
-# Color helpers
-# -----------------------------
-def _heat_rs(v):
-    try:
-        v = float(v)
-    except:
-        return ""
-    if np.isnan(v):
-        return ""
-    x = (v - 1) / 98.0
-    if x < 0.5:
-        r = 255
-        g = int(80 + (x/0.5) * (180-80))
-    else:
-        r = int(255 - ((x-0.5)/0.5) * (255-40))
-        g = 200
-    b = 60
-    return f"background-color: rgb({r},{g},{b}); color:#0B0B0B; font-weight:900;"
-
-def _pct_text(v):
-    try:
-        v = float(v)
-    except:
-        return ""
-    if np.isnan(v):
-        return ""
-    if v > 0:
-        return "color: #7CFC9A; font-weight: 800;"
-    if v < 0:
-        return "color: #FF6B6B; font-weight: 800;"
-    return "opacity:0.9; font-weight:700;"
-
-def _spark_color(s):
-    """
-    IMPORTANT CHANGE:
-    Color the SPARKLINE ITSELF (text color), NOT the background.
-    """
-    strength = spark_strength(s)
-    if np.isnan(strength):
-        return ""
-    x = float(strength)
-    if x < 0.5:
-        r = 255
-        g = int(80 + (x/0.5) * (180-80))
-    else:
-        r = int(255 - ((x-0.5)/0.5) * (255-40))
-        g = 200
-    b = 60
-    return f"color: rgb({r},{g},{b}); font-weight:900;"
-
-def style_df(df: pd.DataFrame):
-    fmt = {
-        "Price": "${:,.2f}",
-        "% 1D": "{:.2%}", "% 1W": "{:.2%}", "% 1M": "{:.2%}",
-        "% 3M": "{:.2%}", "% 6M": "{:.2%}", "% 1Y": "{:.2%}",
-        "RS 1W": "{:.0f}", "RS 1M": "{:.0f}", "RS 3M": "{:.0f}", "RS 6M": "{:.0f}", "RS 1Y": "{:.0f}",
-    }
-
-    rs_cols = ["RS 1W", "RS 1M", "RS 3M", "RS 6M", "RS 1Y"]
-    pct_cols = ["% 1D", "% 1W", "% 1M", "% 3M", "% 6M", "% 1Y"]
-
-    sty = df.style.format(fmt, na_rep="").hide(axis="index")
-
-    for c in rs_cols:
-        if c in df.columns:
-            sty = sty.applymap(_heat_rs, subset=[c])
-
-    for c in pct_cols:
-        if c in df.columns:
-            sty = sty.applymap(_pct_text, subset=[c])
-
-    # Sparkline styling (only if visible)
-    if SHOW_SPARKLINE and "Relative Strength 1M" in df.columns:
-        sty = sty.applymap(_spark_color, subset=["Relative Strength 1M"])
-        sty = sty.set_properties(
-            subset=["Relative Strength 1M"],
-            **{"font-family": "monospace", "font-weight": "900"}
-        )
-
-    return sty
-
-# -----------------------------
-# Manual inputs
+# Manual inputs (unchanged)
 # -----------------------------
 DEFAULT_RIGHT = {
     "Market Exposure": {"IBD Exposure": "40-60%", "Selected": "X"},
@@ -561,50 +499,186 @@ def right_panel_ui():
     st.session_state.right_panel = rp
 
 # -----------------------------
-# Grouped sub-sector helpers (clean headers)
+# Sub-sector grouped rows (clean headers, truly blank other cells)
 # -----------------------------
 def grouped_block(groups: dict[str, list[str]], df_by_ticker: dict[str, dict]) -> pd.DataFrame:
     out_rows = []
     for group_name, ticks in groups.items():
-        # Header row: only Name populated; everything else NaN/blank (so NO "None")
+        # Header row: ONLY Name; everything else BLANK strings so Streamlit will never show None/NaN
         out_rows.append({
             "Ticker": "",
             "Name": group_name,
-            "Price": np.nan,
+            "Price": "",
             "Relative Strength 1M": "",
-            "RS 1W": np.nan, "RS 1M": np.nan, "RS 3M": np.nan, "RS 6M": np.nan, "RS 1Y": np.nan,
-            "% 1D": np.nan, "% 1W": np.nan, "% 1M": np.nan, "% 3M": np.nan, "% 6M": np.nan, "% 1Y": np.nan,
+            "RS 1W": "", "RS 1M": "", "RS 3M": "", "RS 6M": "", "RS 1Y": "",
+            "% 1D": "", "% 1W": "", "% 1M": "", "% 3M": "", "% 6M": "", "% 1Y": "",
+            "__spark_levels": [],
+            "__is_header": True
         })
         for t in ticks:
             if t in df_by_ticker:
                 out_rows.append(df_by_ticker[t])
     return pd.DataFrame(out_rows)
 
-def style_grouped(df: pd.DataFrame):
-    sty = style_df(df)
+# -----------------------------
+# HTML rendering helpers
+# -----------------------------
+def rs_bg(v):
+    """Background for RS rank 1..99."""
+    try:
+        v = float(v)
+    except:
+        return ""
+    if np.isnan(v):
+        return ""
+    x = (v - 1) / 98.0
+    if x < 0.5:
+        r = 255
+        g = int(80 + (x/0.5) * (180-80))
+    else:
+        r = int(255 - ((x-0.5)/0.5) * (255-40))
+        g = 200
+    b = 60
+    return f"background-color: rgb({r},{g},{b}); color:#0B0B0B; font-weight:900; border-radius:6px; padding:2px 6px; display:inline-block; min-width:32px; text-align:center;"
 
-    def _header_row_styles(row):
-        is_header = (str(row.get("Ticker", "")).strip() == "") and (str(row.get("Name", "")).strip() != "")
-        if not is_header:
-            return ["" for _ in row.index]
+def pct_style(v):
+    """Green/red text for %."""
+    try:
+        v = float(v)
+    except:
+        return ""
+    if np.isnan(v):
+        return ""
+    if v > 0:
+        return "color:#7CFC9A; font-weight:800;"
+    if v < 0:
+        return "color:#FF6B6B; font-weight:800;"
+    return "opacity:0.9; font-weight:700;"
 
-        styles = []
-        for col in row.index:
-            if col == "Name":
-                styles.append(
-                    "font-weight:950;"
-                    "background-color: rgba(0,0,0,0.65);"
-                    "color: #FFFFFF;"
-                )
+def fmt_price(v):
+    if v == "" or v is None:
+        return ""
+    try:
+        return f"${float(v):,.2f}"
+    except:
+        return ""
+
+def fmt_pct(v):
+    if v == "" or v is None:
+        return ""
+    try:
+        return f"{float(v):.2%}"
+    except:
+        return ""
+
+def fmt_rs(v):
+    if v == "" or v is None:
+        return ""
+    try:
+        return f"{float(v):.0f}"
+    except:
+        return ""
+
+def spark_html(spark: str, levels: list[int]):
+    """
+    Excel-like: low points red, high points green, mid amber.
+    Color is per-character based on its level (0..7).
+    """
+    if not spark or not levels or len(spark) != len(levels):
+        return ""
+
+    def level_to_rgb(lv: int):
+        # lv 0..7 -> red->amber->green
+        t = lv / 7.0
+        # two-stage blend: red->amber at 0.5, amber->green at 0.5..1
+        if t <= 0.5:
+            k = t / 0.5
+            r1, g1, b1 = 255, 80, 80    # red
+            r2, g2, b2 = 255, 200, 60   # amber
+            r = int(r1 + (r2 - r1) * k)
+            g = int(g1 + (g2 - g1) * k)
+            b = int(b1 + (b2 - b1) * k)
+        else:
+            k = (t - 0.5) / 0.5
+            r1, g1, b1 = 255, 200, 60   # amber
+            r2, g2, b2 = 80, 255, 120   # green
+            r = int(r1 + (r2 - r1) * k)
+            g = int(g1 + (g2 - g1) * k)
+            b = int(b1 + (b2 - b1) * k)
+        return r, g, b
+
+    spans = []
+    for ch, lv in zip(spark, levels):
+        r, g, b = level_to_rgb(int(lv))
+        spans.append(f'<span style="color: rgb({r},{g},{b}); font-weight:900;">{ch}</span>')
+    return "".join(spans)
+
+def render_table_html(df: pd.DataFrame, columns: list[str], height_px: int = 360):
+    # Make sure we don't show NaN/None text
+    d = df.copy()
+
+    # Build header row
+    th = "".join([f"<th>{c}</th>" for c in columns])
+
+    # Build body
+    trs = []
+    for _, row in d.iterrows():
+        is_header = bool(row.get("__is_header", False))
+
+        tr_class = "group-row" if is_header else ""
+        tds = []
+
+        for c in columns:
+            val = row.get(c, "")
+
+            # cell class helpers
+            td_class = ""
+            if c == "Ticker":
+                td_class = "ticker"
+            elif c == "Name":
+                td_class = "name"
+            elif c == "Relative Strength 1M":
+                td_class = "mono"
+
+            # formatting per column
+            if is_header:
+                # We already blanked everything except Name in grouped_block()
+                cell_html = str(val) if c == "Name" else ""
             else:
-                # black out the rest of the row
-                styles.append(
-                    "background-color: rgba(0,0,0,0.65);"
-                    "color: rgba(0,0,0,0);"   # hide any stray text if it ever appears
-                )
-        return styles
+                if c == "Price":
+                    cell_html = fmt_price(val)
+                elif c.startswith("% "):
+                    cell_html = fmt_pct(val)
+                    stl = pct_style(val)
+                    if stl:
+                        cell_html = f'<span style="{stl}">{cell_html}</span>'
+                elif c.startswith("RS "):
+                    txt = fmt_rs(val)
+                    stl = rs_bg(val)
+                    if stl and txt != "":
+                        cell_html = f'<span style="{stl}">{txt}</span>'
+                    else:
+                        cell_html = txt
+                elif c == "Relative Strength 1M":
+                    cell_html = spark_html(str(val), row.get("__spark_levels", []))
+                else:
+                    cell_html = "" if (val is None or (isinstance(val, float) and np.isnan(val))) else str(val)
 
-    return sty.apply(_header_row_styles, axis=1)
+            tds.append(f'<td class="{td_class}">{cell_html}</td>')
+
+        trs.append(f'<tr class="{tr_class}">' + "".join(tds) + "</tr>")
+
+    table = f"""
+    <div class="pl-table-wrap" style="max-height:{height_px}px; overflow:auto;">
+      <table class="pl-table">
+        <thead><tr>{th}</tr></thead>
+        <tbody>
+          {''.join(trs)}
+        </tbody>
+      </table>
+    </div>
+    """
+    st.markdown(table, unsafe_allow_html=True)
 
 # =========================
 # UI
@@ -619,6 +693,7 @@ with st.sidebar:
         fetch_names.clear()
         st.rerun()
 
+# Pull prices
 pull_list = list(dict.fromkeys(ALL_TICKERS + [BENCHMARK]))
 
 try:
@@ -632,6 +707,7 @@ name_map = fetch_names(pull_list)
 df_major = build_table(price_df, MAJOR, name_map)
 df_sectors = build_table(price_df, SECTORS, name_map)
 
+# Sub-sector master then map by ticker
 all_sub_ticks = []
 for v in list(SUBSECTOR_ALL.values()):
     all_sub_ticks.extend(v)
@@ -639,61 +715,31 @@ all_sub_ticks = [t for t in all_sub_ticks if t in ALL_TICKERS_SET]
 
 df_sub_master = build_table(price_df, all_sub_ticks, name_map)
 df_by_ticker = {r["Ticker"]: r.to_dict() for _, r in df_sub_master.iterrows()}
+
 df_sub_all = grouped_block(SUBSECTOR_ALL, df_by_ticker)
 
-# Column order
-base_cols = [
-    "Ticker", "Name", "Price",
+# Column order (ticker first; no index column exists in HTML table)
+show_cols = [
+    "Ticker", "Name", "Price", "Relative Strength 1M",
     "RS 1W", "RS 1M", "RS 3M", "RS 6M", "RS 1Y",
     "% 1D", "% 1W", "% 1M", "% 3M", "% 6M", "% 1Y"
 ]
-show_cols = (["Ticker", "Name", "Price", "Relative Strength 1M"] + base_cols[3:]) if SHOW_SPARKLINE else base_cols
 
 # ---- Major Indexes ----
 st.markdown('<div class="section-title">Major U.S. Indexes</div>', unsafe_allow_html=True)
-st.dataframe(
-    style_df(df_major[show_cols]),
-    use_container_width=True,
-    height=330,
-    hide_index=True,
-    column_config={
-        "Ticker": st.column_config.TextColumn(width="small"),
-        "Name": st.column_config.TextColumn(width="large"),
-        "Relative Strength 1M": st.column_config.TextColumn(width="large"),
-    },
-)
+render_table_html(df_major, show_cols, height_px=330)
 
 st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
 # ---- Sectors ----
 st.markdown('<div class="section-title">U.S. Sectors</div>', unsafe_allow_html=True)
-st.dataframe(
-    style_df(df_sectors[show_cols]),
-    use_container_width=True,
-    height=360,
-    hide_index=True,
-    column_config={
-        "Ticker": st.column_config.TextColumn(width="small"),
-        "Name": st.column_config.TextColumn(width="large"),
-        "Relative Strength 1M": st.column_config.TextColumn(width="large"),
-    },
-)
+render_table_html(df_sectors, show_cols, height_px=360)
 
 st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
 # ---- Sub-sectors ----
 st.markdown('<div class="section-title">U.S. Sub-Sectors / Industry Groups</div>', unsafe_allow_html=True)
-st.dataframe(
-    style_grouped(df_sub_all[show_cols]),
-    use_container_width=True,
-    height=1100,
-    hide_index=True,
-    column_config={
-        "Ticker": st.column_config.TextColumn(width="small"),
-        "Name": st.column_config.TextColumn(width="large"),
-        "Relative Strength 1M": st.column_config.TextColumn(width="large"),
-    },
-)
+render_table_html(df_sub_all, show_cols, height_px=1100)
 
 st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
