@@ -9,6 +9,18 @@ import yfinance as yf
 st.set_page_config(page_title="Market Overview Dashboard", layout="wide")
 
 # =========================
+# OPTIONS
+# =========================
+BENCHMARK = "SPY"
+PRICE_HISTORY_PERIOD = "2y"
+
+# If you truly want to HIDE the sparkline column entirely, set this to False
+SHOW_SPARKLINE = True
+
+def _asof_ts():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+# =========================
 # CSS
 # =========================
 CSS = """
@@ -25,17 +37,15 @@ CSS = """
   margin-bottom: 10px;
 }
 [data-testid="stDataFrame"] {border-radius: 10px; overflow: hidden;}
+
+/* Try to allow wrapping so long group names are readable */
+[data-testid="stDataFrame"] div[role="gridcell"] > div {
+  white-space: normal !important;
+  line-height: 1.15 !important;
+}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
-
-BENCHMARK = "SPY"
-
-# Hard-code a safe history window to support 1Y (252 trading days) + clean RS calc
-PRICE_HISTORY_PERIOD = "2y"
-
-def _asof_ts():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 # ============================================================
 # YOUR TICKER LIST (1 per line)
@@ -209,7 +219,6 @@ def parse_ticker_list(raw: str) -> list[str]:
         t = ln.strip().upper()
         if t:
             out.append(t)
-    # keep order, remove duplicates
     seen = set()
     uniq = []
     for t in out:
@@ -267,7 +276,6 @@ SUBSECTOR_RIGHT = {
     "Specialty REITs": ["SRVR","HOMZ","SCHH","NETL"],
 }
 
-# ONE long column: left groups, then right groups under it
 SUBSECTOR_ALL = {}
 SUBSECTOR_ALL.update(SUBSECTOR_LEFT)
 SUBSECTOR_ALL.update(SUBSECTOR_RIGHT)
@@ -311,7 +319,6 @@ def fetch_names(tickers: list[str]) -> dict[str, str]:
                 names[t] = str(n)
         except Exception:
             pass
-    # nice overrides for your majors
     names["SPY"] = "S&P 500"
     names["QQQ"] = "Nasdaq-100"
     names["DIA"] = "Dow"
@@ -340,7 +347,6 @@ def sparkline_from_series(s: pd.Series, n=26) -> str:
     return "".join(SPARK_CHARS[i] for i in idx)
 
 def spark_strength(s: str) -> float:
-    """0..1 based on average spark 'height'."""
     s = (s or "").strip()
     if not s:
         return np.nan
@@ -362,15 +368,8 @@ def _ratio_rs(close_t: pd.Series, close_b: pd.Series, periods: int):
     return (t / b) - 1
 
 def build_table(p: pd.DataFrame, tickers: list[str], name_map: dict[str, str]) -> pd.DataFrame:
-    """
-    Returns a table with:
-      Price
-      Sparkline of 1M RS ratio series
-      RS ranks: RS 1W, RS 1M, RS 3M, RS 6M, RS 1Y (1-99)
-      Returns: % 1D, % 1W, % 1M, % 3M, % 6M, % 1Y (true decimals)
-    """
     horizons_ret = {"% 1D": 1, "% 1W": 5, "% 1M": 21, "% 3M": 63, "% 6M": 126, "% 1Y": 252}
-    horizons_rs = {"RS 1W": 5, "RS 1M": 21, "RS 3M": 63, "RS 6M": 126, "RS 1Y": 252}
+    horizons_rs  = {"RS 1W": 5, "RS 1M": 21, "RS 3M": 63, "RS 6M": 126, "RS 1Y": 252}
 
     b = p[BENCHMARK]
 
@@ -382,7 +381,6 @@ def build_table(p: pd.DataFrame, tickers: list[str], name_map: dict[str, str]) -
         close = p[t]
         last_price = float(close.dropna().iloc[-1]) if close.dropna().shape[0] else np.nan
 
-        # Sparkline uses RS ratio series (rolling comparison window)
         rs_ratio_series = (close / close.shift(21)) / (b / b.shift(21))
         spark = sparkline_from_series(rs_ratio_series, n=26)
 
@@ -393,12 +391,10 @@ def build_table(p: pd.DataFrame, tickers: list[str], name_map: dict[str, str]) -
             "Relative Strength 1M": spark,
         }
 
-        # RS raw values first (convert to ranks after)
         for col, n in horizons_rs.items():
             rr = _ratio_rs(close, b, n)
             rec[col] = float(rr.dropna().iloc[-1]) if rr.dropna().shape[0] else np.nan
 
-        # Returns
         for col, n in horizons_ret.items():
             r = _ret(close, n)
             rec[col] = float(r.dropna().iloc[-1]) if r.dropna().shape[0] else np.nan
@@ -415,10 +411,9 @@ def build_table(p: pd.DataFrame, tickers: list[str], name_map: dict[str, str]) -
     return df
 
 # -----------------------------
-# Color helpers (Green / Amber / Red like your sheet)
+# Color helpers
 # -----------------------------
 def _heat_rs(v):
-    # v expected 1..99 (rank)
     try:
         v = float(v)
     except:
@@ -448,11 +443,14 @@ def _pct_text(v):
         return "color: #FF6B6B; font-weight: 800;"
     return "opacity:0.9; font-weight:700;"
 
-def _spark_heat(s):
+def _spark_color(s):
+    """
+    IMPORTANT CHANGE:
+    Color the SPARKLINE ITSELF (text color), NOT the background.
+    """
     strength = spark_strength(s)
     if np.isnan(strength):
         return ""
-    # map 0..1 to the same red->amber->green vibe
     x = float(strength)
     if x < 0.5:
         r = 255
@@ -461,7 +459,7 @@ def _spark_heat(s):
         r = int(255 - ((x-0.5)/0.5) * (255-40))
         g = 200
     b = 60
-    return f"background-color: rgb({r},{g},{b}); color:#0B0B0B; font-weight:900;"
+    return f"color: rgb({r},{g},{b}); font-weight:900;"
 
 def style_df(df: pd.DataFrame):
     fmt = {
@@ -474,7 +472,7 @@ def style_df(df: pd.DataFrame):
     rs_cols = ["RS 1W", "RS 1M", "RS 3M", "RS 6M", "RS 1Y"]
     pct_cols = ["% 1D", "% 1W", "% 1M", "% 3M", "% 6M", "% 1Y"]
 
-    sty = df.style.format(fmt, na_rep="")
+    sty = df.style.format(fmt, na_rep="").hide(axis="index")
 
     for c in rs_cols:
         if c in df.columns:
@@ -484,8 +482,9 @@ def style_df(df: pd.DataFrame):
         if c in df.columns:
             sty = sty.applymap(_pct_text, subset=[c])
 
-    if "Relative Strength 1M" in df.columns:
-        sty = sty.applymap(_spark_heat, subset=["Relative Strength 1M"])
+    # Sparkline styling (only if visible)
+    if SHOW_SPARKLINE and "Relative Strength 1M" in df.columns:
+        sty = sty.applymap(_spark_color, subset=["Relative Strength 1M"])
         sty = sty.set_properties(
             subset=["Relative Strength 1M"],
             **{"font-family": "monospace", "font-weight": "900"}
@@ -494,7 +493,7 @@ def style_df(df: pd.DataFrame):
     return sty
 
 # -----------------------------
-# Manual inputs (moved UNDER sub-sectors)
+# Manual inputs
 # -----------------------------
 DEFAULT_RIGHT = {
     "Market Exposure": {"IBD Exposure": "40-60%", "Selected": "X"},
@@ -567,7 +566,7 @@ def right_panel_ui():
 def grouped_block(groups: dict[str, list[str]], df_by_ticker: dict[str, dict]) -> pd.DataFrame:
     out_rows = []
     for group_name, ticks in groups.items():
-        # Header row: label in Name (wider), everything else blank
+        # Header row: only Name populated; everything else NaN/blank (so NO "None")
         out_rows.append({
             "Ticker": "",
             "Name": group_name,
@@ -586,9 +585,24 @@ def style_grouped(df: pd.DataFrame):
 
     def _header_row_styles(row):
         is_header = (str(row.get("Ticker", "")).strip() == "") and (str(row.get("Name", "")).strip() != "")
-        if is_header:
-            return ["font-weight:950; background-color: rgba(255,255,255,0.05);" for _ in row.index]
-        return ["" for _ in row.index]
+        if not is_header:
+            return ["" for _ in row.index]
+
+        styles = []
+        for col in row.index:
+            if col == "Name":
+                styles.append(
+                    "font-weight:950;"
+                    "background-color: rgba(0,0,0,0.65);"
+                    "color: #FFFFFF;"
+                )
+            else:
+                # black out the rest of the row
+                styles.append(
+                    "background-color: rgba(0,0,0,0.65);"
+                    "color: rgba(0,0,0,0);"   # hide any stray text if it ever appears
+                )
+        return styles
 
     return sty.apply(_header_row_styles, axis=1)
 
@@ -605,7 +619,6 @@ with st.sidebar:
         fetch_names.clear()
         st.rerun()
 
-# Pull prices
 pull_list = list(dict.fromkeys(ALL_TICKERS + [BENCHMARK]))
 
 try:
@@ -619,7 +632,6 @@ name_map = fetch_names(pull_list)
 df_major = build_table(price_df, MAJOR, name_map)
 df_sectors = build_table(price_df, SECTORS, name_map)
 
-# Build sub-sector master then map by ticker
 all_sub_ticks = []
 for v in list(SUBSECTOR_ALL.values()):
     all_sub_ticks.extend(v)
@@ -627,15 +639,15 @@ all_sub_ticks = [t for t in all_sub_ticks if t in ALL_TICKERS_SET]
 
 df_sub_master = build_table(price_df, all_sub_ticks, name_map)
 df_by_ticker = {r["Ticker"]: r.to_dict() for _, r in df_sub_master.iterrows()}
-
 df_sub_all = grouped_block(SUBSECTOR_ALL, df_by_ticker)
 
-# Column order EXACTLY like your sheet vibe
-show_cols = [
-    "Ticker", "Name", "Price", "Relative Strength 1M",
+# Column order
+base_cols = [
+    "Ticker", "Name", "Price",
     "RS 1W", "RS 1M", "RS 3M", "RS 6M", "RS 1Y",
     "% 1D", "% 1W", "% 1M", "% 3M", "% 6M", "% 1Y"
 ]
+show_cols = (["Ticker", "Name", "Price", "Relative Strength 1M"] + base_cols[3:]) if SHOW_SPARKLINE else base_cols
 
 # ---- Major Indexes ----
 st.markdown('<div class="section-title">Major U.S. Indexes</div>', unsafe_allow_html=True)
@@ -643,9 +655,10 @@ st.dataframe(
     style_df(df_major[show_cols]),
     use_container_width=True,
     height=330,
+    hide_index=True,
     column_config={
         "Ticker": st.column_config.TextColumn(width="small"),
-        "Name": st.column_config.TextColumn(width="medium"),
+        "Name": st.column_config.TextColumn(width="large"),
         "Relative Strength 1M": st.column_config.TextColumn(width="large"),
     },
 )
@@ -658,21 +671,23 @@ st.dataframe(
     style_df(df_sectors[show_cols]),
     use_container_width=True,
     height=360,
+    hide_index=True,
     column_config={
         "Ticker": st.column_config.TextColumn(width="small"),
-        "Name": st.column_config.TextColumn(width="medium"),
+        "Name": st.column_config.TextColumn(width="large"),
         "Relative Strength 1M": st.column_config.TextColumn(width="large"),
     },
 )
 
 st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-# ---- Sub-sectors (ONE column) ----
+# ---- Sub-sectors ----
 st.markdown('<div class="section-title">U.S. Sub-Sectors / Industry Groups</div>', unsafe_allow_html=True)
 st.dataframe(
     style_grouped(df_sub_all[show_cols]),
     use_container_width=True,
     height=1100,
+    hide_index=True,
     column_config={
         "Ticker": st.column_config.TextColumn(width="small"),
         "Name": st.column_config.TextColumn(width="large"),
@@ -684,3 +699,4 @@ st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
 # ---- Manual Inputs UNDER everything ----
 right_panel_ui()
+
